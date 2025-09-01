@@ -1,0 +1,270 @@
+using MySql.Data.MySqlClient;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+public class Server
+{
+    private Dictionary<int, TcpClient> connectedClients = new Dictionary<int, TcpClient>();
+    private readonly TcpListener _listener;
+    private readonly List<TcpClient> _clients = new List<TcpClient>();
+
+    public Server(string ip, int port)
+    {
+        _listener = new TcpListener(IPAddress.Parse(ip), port);
+    }
+
+    public async Task StartAsync()
+    {
+        _listener.Start();
+        Console.WriteLine("✅ Сервер запущен, ожидаем подключения...");
+
+        while (true)
+        {
+            var client = await _listener.AcceptTcpClientAsync();
+            Console.WriteLine($"🟢 Новый клиент подключен: {client.Client.RemoteEndPoint}");
+            _clients.Add(client);
+
+            // Обрабатываем клиента в отдельной задаче
+            _ = HandleClientAsync(client);
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client)
+    {
+        var stream = client.GetStream();
+        var reader = new StreamReader(stream, Encoding.UTF8);
+
+        // Получаем идентификатор пользователя от клиента
+        string intro = await reader.ReadLineAsync();
+        int userId = -1;
+
+        if (intro != null && intro.StartsWith("USERID:"))
+        {
+            userId = int.Parse(intro.Substring(7));
+
+            // Проверяем, существует ли пользователь с таким ID в базе данных
+            if (UserExistsInDatabase(userId))
+            {
+                connectedClients[userId] = client;
+                Console.WriteLine($"Пользователь {userId} подключен.");
+            }
+            else
+            {
+                Console.WriteLine($"❌ Пользователь с ID {userId} не существует в базе данных.");
+                client.Close();
+                return;
+            }
+        }
+        else
+        {
+            Console.WriteLine("❌ Не удалось получить идентификатор пользователя.");
+            client.Close();
+            return;
+        }
+
+        // Передаем userId в ListenToClientAsync
+        await ListenToClientAsync(userId, client, reader);
+    }
+
+    private bool UserExistsInDatabase(int userId)
+    {
+        string connectionString = "Server=sql8.freesqldatabase.com;" +
+                                   "Database=sql8771867;" +
+                                   "User=sql8771867;" +
+                                   "Password=zhx9FVLUs5;" +
+                                   "Port=3306;" +
+                                   "CharSet=utf8mb4;";
+
+        using (var connection = new MySqlConnection(connectionString))
+        {
+            connection.Open();
+
+            string query = "SELECT COUNT(*) FROM Users WHERE UserID = @UserID";
+
+            using (var command = new MySqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@UserID", userId);
+                var result = command.ExecuteScalar();
+
+                return Convert.ToInt32(result) > 0;
+            }
+        }
+    }
+
+    private async Task ListenToClientAsync(int userId, TcpClient client, StreamReader reader)
+    {
+        string line;
+        while ((line = await reader.ReadLineAsync()) != null)
+        {
+            Console.WriteLine($"📥 Получено сообщение от {userId}: {line}"); // Логирование для диагностики
+
+            // Проверяем, что сообщение в правильном формате
+            if (line.StartsWith("TO:"))
+            {
+                var parts = line.Split('|');
+                var receiverId = int.Parse(parts[0].Substring(3));
+                var messageText = parts[1];
+
+                // Сохраняем сообщение в базе данных
+                SaveMessageToDatabase(userId, receiverId, messageText);
+
+                // Отправляем сообщение только нужному клиенту
+                if (connectedClients.TryGetValue(receiverId, out TcpClient targetClient))
+                {
+                    var targetWriter = new StreamWriter(targetClient.GetStream(), Encoding.UTF8) { AutoFlush = true };
+                    Console.WriteLine($"📤 Отправляем сообщение от {userId} к {receiverId}: {messageText}");
+
+                    // Отправляем сообщение пользователю
+                    await targetWriter.WriteLineAsync(messageText);
+                }
+                else
+                {
+                    Console.WriteLine($"❌ Клиент с ID {receiverId} не подключен.");
+                }
+            }
+        }
+    }
+
+    private async Task SendMessageToClientAsync(TcpClient client, string message)
+    {
+        try
+        {
+            var writer = new StreamWriter(client.GetStream(), Encoding.UTF8) { AutoFlush = true };
+            await writer.WriteLineAsync(message);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Ошибка отправки сообщения клиенту: {ex.Message}");
+        }
+    }
+
+    private List<int> GetGroupMembers(int groupId)
+    {
+        var members = new List<int>();
+        string connectionString = "Server=sql8.freesqldatabase.com;" +
+                                   "Database=sql8771867;" +
+                                   "User=sql8771867;" +
+                                   "Password=zhx9FVLUs5;" +
+                                   "Port=3306;" +
+                                   "CharSet=utf8mb4;";
+
+        using (var connection = new MySqlConnection(connectionString))
+        {
+            connection.Open();
+
+            string query = @"
+            SELECT UserID
+            FROM GroupUsers
+            WHERE GroupID = @GroupID";
+
+            using (var command = new MySqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@GroupID", groupId);
+
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        members.Add(reader.GetInt32("UserID"));
+                    }
+                }
+            }
+        }
+
+        return members;
+    }
+
+    private void SaveGroupMessageToDatabase(int senderId, int groupId, string messageText)
+    {
+        string connectionString = "Server=sql8.freesqldatabase.com;" +
+                                   "Database=sql8771867;" +
+                                   "User=sql8771867;" +
+                                   "Password=zhx9FVLUs5;" +
+                                   "Port=3306;" +
+                                   "CharSet=utf8mb4;";
+
+        try
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                connection.Open();
+
+                string query = @"
+                INSERT INTO Messages (SenderID, GroupID, MessageText, CreatedAt)
+                VALUES (@SenderID, @GroupID, @MessageText, NOW())";
+
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    command.Parameters.AddWithValue("@SenderID", senderId);
+                    command.Parameters.AddWithValue("@GroupID", groupId);
+                    command.Parameters.AddWithValue("@MessageText", messageText);
+
+                    command.ExecuteNonQuery();
+                }
+            }
+            Console.WriteLine($"✅ Сообщение от {senderId} для группы {groupId} сохранено.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Ошибка при сохранении сообщения для группы: {ex.Message}");
+        }
+    }
+
+    private void SaveMessageToDatabase(int senderId, int receiverId, string messageText)
+    {
+        string connectionString = "Server=sql8.freesqldatabase.com;" +
+                                   "Database=sql8771867;" +
+                                   "User=sql8771867;" +
+                                   "Password=zhx9FVLUs5;" +
+                                   "Port=3306;" +
+                                   "CharSet=utf8mb4;";
+
+        try
+        {
+            using (var connection = new MySqlConnection(connectionString))
+            {
+                connection.Open();
+
+                string query = @"
+                INSERT INTO Messages (SenderID, ReceiverID, MessageText, CreatedAt)
+                VALUES (@SenderID, @ReceiverID, @MessageText, NOW())";
+
+                using (var command = new MySqlCommand(query, connection))
+                {
+                    command.Parameters.AddWithValue("@SenderID", senderId);
+                    command.Parameters.AddWithValue("@ReceiverID", receiverId);
+                    command.Parameters.AddWithValue("@MessageText", messageText);
+
+                    command.ExecuteNonQuery();
+                }
+            }
+            Console.WriteLine($"✅ Сообщение от {senderId} к {receiverId} сохранено.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Ошибка при сохранении сообщения: {ex.Message}");
+        }
+    }
+}
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var server = new Server("127.0.0.1", 8888);
+
+        try
+        {
+            await server.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка запуска сервера: {ex.Message}");
+        }
+    }
+}
